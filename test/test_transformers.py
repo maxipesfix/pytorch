@@ -2621,6 +2621,84 @@ class TestSDPAFailureModes(NNTestCase):
         # before the fix, all rows past 2**32 // seq_len were garbage
         self.assertEqual(out, ref, atol=5e-3, rtol=5e-3)
 
+    @largeTensorTest("48GB", "cuda")
+    @onlyCUDA
+    @unittest.skipIf(not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "Does not support Efficient Attention")
+    @parametrize("layout", ["split_kv", "contiguous"])
+    def test_mem_eff_attention_large_kv_offset_overflow(self, layout):
+        # Key/value element offsets past 32 bits used to wrap in the kernel.
+        num_heads, head_dim, num_queries = 64, 256, 32
+        torch.manual_seed(0)
+        make_tensor = partial(torch.randn, device="cuda", dtype=torch.bfloat16, requires_grad=True)
+        query = make_tensor(1, num_heads, num_queries, head_dim)
+        if layout == "split_kv":
+            # key row stride is 2 * num_heads * head_dim, so the last key row is past 2**31
+            kv = make_tensor(1, 65600, num_heads, 2 * head_dim)
+            key, value = kv.transpose(1, 2).split(head_dim, dim=-1)
+        else:
+            # the last head is past 2**32
+            key = make_tensor(1, num_heads, 266400, head_dim)
+            value = make_tensor(1, num_heads, 266400, head_dim)
+
+        # Attend only to the last keys, which have the largest offsets, so wrong reads dominate.
+        attn_mask = torch.zeros(num_queries, key.size(2), device="cuda", dtype=torch.bool)
+        attn_mask[:, -64:] = True
+
+        with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+            out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+        grad_out = torch.randn_like(out)
+        grads = torch.autograd.grad(out, (query, key, value), grad_out)
+
+        # fp32 math reference on the last head, which has the largest offsets
+        q_ref, k_ref, v_ref = (t[:, -1:].detach().float().requires_grad_() for t in (query, key, value))
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            out_ref = F.scaled_dot_product_attention(q_ref, k_ref, v_ref, attn_mask=attn_mask)
+        grads_ref = torch.autograd.grad(out_ref, (q_ref, k_ref, v_ref), grad_out[:, -1:].float())
+
+        self.assertEqual(out[:, -1:], out_ref, atol=2e-2, rtol=2e-2, exact_dtype=False)
+        for grad, grad_ref in zip(grads, grads_ref):
+            self.assertEqual(grad[:, -1:], grad_ref, atol=2e-2, rtol=2e-2, exact_dtype=False)
+
+    @largeTensorTest("10GB", "cuda")
+    @onlyCUDA
+    @unittest.skipIf(not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "Does not support Efficient Attention")
+    def test_mem_eff_attention_single_query_large_bias_head_stride(self):
+        # A single query with keys broadcast over heads iterates over heads as
+        # rows, which used to truncate a bias head stride past 2**31.
+        num_heads, head_dim, seq_len = 2, 64, 1024
+        torch.manual_seed(0)
+        make_tensor = partial(torch.randn, device="cuda", dtype=torch.bfloat16)
+        query = make_tensor(1, num_heads, 1, head_dim)
+        key = make_tensor(1, 1, seq_len, head_dim).expand(-1, num_heads, -1, -1)
+        value = make_tensor(1, 1, seq_len, head_dim).expand(-1, num_heads, -1, -1)
+        attn_mask = make_tensor(1, num_heads, 2**31 // seq_len + 8, seq_len)[:, :, -1:]
+
+        with sdpa_kernel(backends=[SDPBackend.EFFICIENT_ATTENTION]):
+            out = F.scaled_dot_product_attention(query, key, value, attn_mask=attn_mask)
+        with sdpa_kernel(backends=[SDPBackend.MATH]):
+            ref = F.scaled_dot_product_attention(query.float(), key.float(), value.float(), attn_mask=attn_mask.float())
+        self.assertEqual(out, ref, atol=2e-2, rtol=2e-2, exact_dtype=False)
+
+    @largeTensorTest("6GB", "cuda")
+    @onlyCUDA
+    @unittest.skipIf(not PLATFORM_SUPPORTS_MEM_EFF_ATTENTION, "Does not support Efficient Attention")
+    @unittest.skipIf(TEST_WITH_ROCM, "The stride check is in the CUDA CUTLASS backward")
+    def test_mem_eff_attention_backward_rejects_int32_overflowing_stride(self):
+        # The backward kernel takes 32-bit row strides; larger ones used to
+        # wrap and read out of bounds.
+        seq_len, head_dim = 2, 64
+        make_tensor = partial(torch.randn, 1, seq_len, 1, head_dim, device="cuda", dtype=torch.bfloat16)
+        query, value = make_tensor(), make_tensor()
+        storage = torch.empty(2**31 * (seq_len - 1) + head_dim, device="cuda", dtype=torch.bfloat16)
+        key = storage.as_strided((1, seq_len, 1, head_dim), (0, 2**31, head_dim, 1))
+        out, lse, seed, offset, _, _ = torch.ops.aten._efficient_attention_forward(
+            query, key.contiguous(), value, None, None, None, seq_len, seq_len, 0.0, 0, True
+        )
+        with self.assertRaisesRegex(RuntimeError, "key.stride\\(1\\) overflows int32"):
+            torch.ops.aten._efficient_attention_backward(
+                torch.randn_like(out), query, key, value, None, out, None, None, seq_len, seq_len, lse, 0.0, seed, offset, 0, False
+            )
+
 
 def _get_block_size_n(device, head_dim, is_dropout, is_causal):
     # This should match the block sizes in the CUDA kernel
