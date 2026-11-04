@@ -25,7 +25,11 @@
 #include <rocblas/rocblas.h>
 
 #include <array>
+#include <chrono>
 #include <exception>
+#include <future>
+#include <memory>
+#include <string>
 #endif
 
 // Test concurrent access to getCurrentCUDABlasHandle and getCUDABlasLtWorkspace
@@ -215,8 +219,9 @@ TEST(CUDABlasHandlePoolTest, EagerCallerWorkspaceSurvivesAtenOps) {
       [&] { at::globalContext().setBlasPreferredBackend(prev_backend); });
 
   at::cuda::CUDAGuard device_guard(0);
-  // Unbinding at the end leaves this stream's public handle without a workspace,
-  // so the test uses a high-priority stream, which no other test here does.
+  // Unbinding at the end leaves this stream's public handle without a
+  // workspace, so the test uses a high-priority stream, on which no other test
+  // here uses a public handle.
   c10::cuda::CUDAStreamGuard stream_guard(
       c10::cuda::getStreamFromPool(/*isHighPriority=*/true));
   const auto handle = at::cuda::getCurrentCUDABlasHandle();
@@ -379,7 +384,7 @@ TEST(CUDABlasHandlePoolTest, CachedWorkspaceLeavesHandleUserOwned) {
 // arena when they are created. The capture runs on a new thread so that the
 // thread's internal handle is created by the getCurrentCUDABlasHandle() call
 // below and first bound inside the capture. On a thread that had already run a
-// GEMM, both would have happened earlier and the test would check neither.
+// GEMM, the handle would already exist and the test would check only the bind.
 TEST(CUDABlasHandlePoolTest, EagerWorkspaceBindIsCaptureSafe) {
   if (!at::cuda::is_available()) {
     return;
@@ -476,6 +481,504 @@ TEST(CUDABlasHandlePoolTest, CaptureHandleKeepsPointerModePerStream) {
   EXPECT_EQ(mode(at::cuda::getCurrentCUDABlasHandle()), rocblas_pointer_mode_device);
   EXPECT_EQ(rocblas_set_pointer_mode(h1, rocblas_pointer_mode_host), rocblas_status_success);
   graph.capture_end();
+}
+
+// Runs `body` on a new thread and rethrows what it throws, so that a failure
+// fails the test instead of terminating the binary.
+template <typename Body>
+void runOnThread(Body body) {
+  std::exception_ptr failure;
+  std::thread thread([&] {
+    try {
+      body();
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  });
+  thread.join();
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
+}
+
+// An exiting thread returns its stream-keyed handles while work it queued may
+// still be running, and such a handle cannot serve two streams at once, so the
+// pool hands it out again only for the stream it ran on.
+template <typename GetHandle>
+void expectHandleFromExitedThreadStaysOnItsStream(
+    GetHandle get_handle,
+    c10::cuda::CUDAStream stream) {
+  at::cuda::CUDAGuard device_guard(0);
+  const auto handle_on = [&](c10::cuda::CUDAStream s) {
+    decltype(get_handle()) handle = nullptr;
+    runOnThread([&] {
+      at::cuda::CUDAGuard guard(0);
+      c10::cuda::CUDAStreamGuard stream_guard(s);
+      handle = get_handle();
+    });
+    return handle;
+  };
+  const auto returned = handle_on(stream);
+  EXPECT_NE(handle_on(c10::cuda::getStreamFromPool()), returned);
+  EXPECT_EQ(handle_on(stream), returned);
+}
+
+// A hipBLASLt handle owns the synchronizer its split-K kernels spin on.
+TEST(CUDABlasHandlePoolTest, LtHandleFromExitedThreadStaysOnItsStream) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  expectHandleFromExitedThreadStaysOnItsStream(
+      [] { return at::cuda::getCurrentCUDABlasLtHandle(); },
+      c10::cuda::getStreamFromPool());
+}
+
+// The same for a stream c10 does not own. The pool never touches the stream,
+// so its owner may destroy it at any time.
+TEST(CUDABlasHandlePoolTest, LtHandleFromExitedThreadStaysOnItsExternalStream) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  cudaStream_t external = nullptr;
+  ASSERT_EQ(
+      cudaStreamCreateWithFlags(&external, cudaStreamNonBlocking), cudaSuccess);
+  expectHandleFromExitedThreadStaysOnItsStream(
+      [] { return at::cuda::getCurrentCUDABlasLtHandle(); },
+      c10::cuda::getStreamFromExternal(external, 0));
+  EXPECT_EQ(cudaStreamDestroy(external), cudaSuccess);
+}
+
+// A public rocBLAS handle keeps the workspace bound at its creation.
+TEST(CUDABlasHandlePoolTest, PublicHandleFromExitedThreadStaysOnItsStream) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  if (at::cuda::isCUDABlasWorkspaceCachingEnabled()) {
+    GTEST_SKIP() << "requires eager workspaces";
+  }
+  expectHandleFromExitedThreadStaysOnItsStream(
+      [] { return at::cuda::getCurrentCUDABlasHandle(); },
+      c10::cuda::getStreamFromPool());
+}
+
+namespace {
+
+// ATen's internal rocBLAS handle for eager work, which embeds a hipBLASLt
+// handle where rocBLAS uses its hipBLASLt backend.
+cublasHandle_t currentInternalCublasHandle() {
+  auto scoped = at::cuda::getCurrentCUDABlasHandleWithWorkspace();
+  return scoped;
+}
+
+} // namespace
+
+TEST(CUDABlasHandlePoolTest, EagerInternalHandleIsPerStream) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  const auto handle_on = [](c10::cuda::CUDAStream stream) {
+    c10::cuda::CUDAStreamGuard stream_guard(stream);
+    return currentInternalCublasHandle();
+  };
+  const auto first = c10::cuda::getStreamFromPool();
+  const auto second = c10::cuda::getStreamFromPool();
+  const auto first_handle = handle_on(first);
+  EXPECT_NE(handle_on(second), first_handle);
+  EXPECT_EQ(handle_on(first), first_handle);
+}
+
+TEST(CUDABlasHandlePoolTest, InternalHandleFromExitedThreadStaysOnItsStream) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  expectHandleFromExitedThreadStaysOnItsStream(
+      [] { return currentInternalCublasHandle(); },
+      c10::cuda::getStreamFromPool());
+}
+
+// A stream first used mid-capture cannot create a handle, so every stream in a
+// capture uses the thread's internal handle rather than a stream's eager one.
+TEST(CUDABlasHandlePoolTest, CaptureUsesThreadsInternalHandle) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  const auto prev_backend = at::globalContext().blasPreferredBackend();
+  at::globalContext().setBlasPreferredBackend(at::BlasBackend::Cublas);
+  auto restore_backend = c10::make_scope_exit(
+      [&] { at::globalContext().setBlasPreferredBackend(prev_backend); });
+  at::cuda::CUDAGuard device_guard(0);
+  const auto capture_stream = c10::cuda::getStreamFromPool();
+  c10::cuda::CUDAStreamGuard stream_guard(capture_stream);
+  const auto options = at::TensorOptions().device(at::kCUDA).dtype(at::kFloat);
+  const auto a = at::randn({64, 64}, options);
+  const auto expected = at::mm(a, a);
+  const auto eager = currentInternalCublasHandle();
+  // A new stream that this thread first uses inside the capture.
+  hipStream_t raw_side = nullptr;
+  ASSERT_EQ(
+      hipStreamCreateWithFlags(&raw_side, hipStreamNonBlocking), hipSuccess);
+  auto destroy_side = c10::make_scope_exit([&] {
+    (void)hipStreamSynchronize(raw_side);
+    (void)hipStreamDestroy(raw_side);
+  });
+  const auto side = c10::cuda::getStreamFromExternal(raw_side, 0);
+
+  at::cuda::CUDAGraph graph;
+  graph.capture_begin();
+  cublasHandle_t captured_handle = nullptr;
+  cublasHandle_t side_handle = nullptr;
+  at::Tensor captured;
+  at::Tensor side_captured;
+  try {
+    captured_handle = currentInternalCublasHandle();
+    captured = at::mm(a, a);
+    at::cuda::CUDAEvent forked;
+    forked.record(capture_stream);
+    forked.block(side);
+    {
+      c10::cuda::CUDAStreamGuard side_guard(side);
+      side_handle = currentInternalCublasHandle();
+      side_captured = at::mm(a, a);
+    }
+    at::cuda::CUDAEvent joined;
+    joined.record(side);
+    joined.block(capture_stream);
+  } catch (...) {
+    // Ends the capture, so that a failure here leaves no capture running.
+    try {
+      graph.capture_end();
+    } catch (...) {
+    }
+    throw;
+  }
+  graph.capture_end();
+  graph.replay();
+  capture_stream.synchronize();
+
+  EXPECT_NE(captured_handle, eager);
+  EXPECT_EQ(side_handle, captured_handle);
+  EXPECT_TRUE(at::allclose(captured, expected));
+  EXPECT_TRUE(at::allclose(side_captured, expected));
+}
+
+// The next thread to take a handle must not wait for an exited thread's work,
+// which may itself wait for work that the next thread queues later. Here the
+// exited thread's stream waits for a value that only the next thread writes.
+TEST(CUDABlasHandlePoolTest, LtHandleTakeDoesNotWaitForExitedThreadsWork) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  int can_wait = 0;
+  ASSERT_EQ(
+      hipDeviceGetAttribute(
+          &can_wait, hipDeviceAttributeCanUseStreamWaitValue, 0),
+      hipSuccess);
+  if (can_wait == 0) {
+    GTEST_SKIP() << "requires hipStreamWaitValue64";
+  }
+  void* gate = nullptr;
+  ASSERT_EQ(
+      hipExtMallocWithFlags(&gate, sizeof(uint64_t), hipMallocSignalMemory),
+      hipSuccess);
+  // HIP maps streams onto a few hardware queues per priority, and a wait blocks
+  // every stream on its queue, so the gated stream has a priority that the
+  // streams opening the gate do not.
+  const auto first = c10::cuda::getStreamFromPool(/*isHighPriority=*/true);
+  const auto second = c10::cuda::getStreamFromPool();
+  const auto opener = c10::cuda::getStreamFromPool();
+  // Both threads take spares, so neither creates a handle while the gate is
+  // closed.
+  at::cuda::ensureCublasLtHandlesAvailable(2);
+  // No stream may still be using the gate when it is freed.
+  auto free_gate = c10::make_scope_exit([&] {
+    (void)hipStreamWriteValue64(opener, gate, 1, 0);
+    (void)hipStreamSynchronize(first);
+    (void)hipStreamSynchronize(second);
+    (void)hipFree(gate);
+  });
+  ASSERT_EQ(hipStreamWriteValue64(first, gate, 0, 0), hipSuccess);
+  ASSERT_EQ(hipStreamSynchronize(first), hipSuccess);
+  // Taking a handle and returning it must not wait for the gated work. Both
+  // are waited for against one deadline, so a regression that waits fails the
+  // test instead of hanging it.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  cublasLtHandle_t returned = nullptr;
+  std::promise<void> owner_exited;
+  auto owner_exit = owner_exited.get_future();
+  std::exception_ptr owner_failure;
+  std::thread owner([&] {
+    // Ready once the thread has returned its handles.
+    owner_exited.set_value_at_thread_exit();
+    try {
+      at::cuda::CUDAGuard guard(0);
+      c10::cuda::CUDAStreamGuard stream_guard(first);
+      returned = at::cuda::getCurrentCUDABlasLtHandle();
+      EXPECT_EQ(
+          hipStreamWaitValue64(first, gate, 1, hipStreamWaitValueGte),
+          hipSuccess);
+    } catch (...) {
+      owner_failure = std::current_exception();
+    }
+  });
+  const bool owner_exited_in_time =
+      owner_exit.wait_until(deadline) == std::future_status::ready;
+
+  cublasLtHandle_t reused = nullptr;
+  at::cuda::CUDAEvent opened;
+  std::atomic<bool> launched{false};
+  std::exception_ptr next_owner_failure;
+  std::thread next_owner;
+  if (owner_exited_in_time) {
+    next_owner = std::thread([&] {
+      try {
+        at::cuda::CUDAGuard guard(0);
+        c10::cuda::CUDAStreamGuard stream_guard(second);
+        reused = at::cuda::getCurrentCUDABlasLtHandle();
+        EXPECT_EQ(hipStreamWriteValue64(second, gate, 1, 0), hipSuccess);
+        opened.record(second);
+        launched = true;
+      } catch (...) {
+        next_owner_failure = std::current_exception();
+      }
+    });
+  }
+  // Does not throw, so the threads are always joined below.
+  const auto gate_opened = [&] {
+    return launched && hipEventQuery(opened.event()) == hipSuccess;
+  };
+  while (next_owner.joinable() && !gate_opened() &&
+         std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  const bool opened_in_time = gate_opened();
+  // Lets any thread or stream still waiting on the gate finish.
+  EXPECT_EQ(hipStreamWriteValue64(opener, gate, 1, 0), hipSuccess);
+  owner.join();
+  if (next_owner.joinable()) {
+    next_owner.join();
+  }
+  for (const auto& failure : {owner_failure, next_owner_failure}) {
+    if (failure) {
+      std::rethrow_exception(failure);
+    }
+  }
+
+  EXPECT_TRUE(owner_exited_in_time);
+  EXPECT_TRUE(opened_in_time);
+  EXPECT_NE(reused, returned);
+}
+
+// A stream's list of returned handles outlives the stream and is reused by a
+// new stream created at the same address. That is safe only because
+// hipStreamDestroy waits for the stream's queued work, which HIP does not
+// promise, so this checks it.
+TEST(CUDABlasHandlePoolTest, StreamDestroyWaitsForQueuedWork) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  int can_wait = 0;
+  ASSERT_EQ(
+      hipDeviceGetAttribute(
+          &can_wait, hipDeviceAttributeCanUseStreamWaitValue, 0),
+      hipSuccess);
+  if (can_wait == 0) {
+    GTEST_SKIP() << "requires hipStreamWaitValue64";
+  }
+  void* gate = nullptr;
+  void* ran = nullptr;
+  hipStream_t stream = nullptr;
+  std::thread destroyer;
+  bool destroy_hung = false;
+  const auto opener = c10::cuda::getStreamFromPool();
+  // Runs on every exit, so no stream is left waiting on the gate. If the gate
+  // cannot be opened or the destroy never returned, the device's state is
+  // unknown, so the destroying thread is detached and the memory is leaked.
+  auto free_memory = c10::make_scope_exit([&] {
+    const bool opened = gate == nullptr ||
+        (hipStreamWriteValue64(opener, gate, 1, 0) == hipSuccess &&
+         hipStreamSynchronize(opener) == hipSuccess);
+    if (destroy_hung || !opened) {
+      if (destroyer.joinable()) {
+        destroyer.detach();
+      }
+      return;
+    }
+    if (destroyer.joinable()) {
+      destroyer.join();
+    } else if (stream != nullptr) {
+      (void)hipStreamDestroy(stream);
+    }
+    (void)hipDeviceSynchronize();
+    (void)hipFree(gate);
+    (void)hipFree(ran);
+  });
+  ASSERT_EQ(
+      hipExtMallocWithFlags(&gate, sizeof(uint64_t), hipMallocSignalMemory),
+      hipSuccess);
+  ASSERT_EQ(
+      hipExtMallocWithFlags(&ran, sizeof(uint64_t), hipMallocSignalMemory),
+      hipSuccess);
+  ASSERT_EQ(hipStreamWriteValue64(opener, gate, 0, 0), hipSuccess);
+  ASSERT_EQ(hipStreamWriteValue64(opener, ran, 0, 0), hipSuccess);
+  ASSERT_EQ(hipStreamSynchronize(opener), hipSuccess);
+  // A priority that `opener` does not have, so the two never share a hardware
+  // queue, which the wait would block.
+  int least_priority = 0;
+  int greatest_priority = 0;
+  ASSERT_EQ(
+      hipDeviceGetStreamPriorityRange(&least_priority, &greatest_priority),
+      hipSuccess);
+  ASSERT_EQ(
+      hipStreamCreateWithPriority(
+          &stream, hipStreamNonBlocking, greatest_priority),
+      hipSuccess);
+  ASSERT_EQ(
+      hipStreamWaitValue64(stream, gate, 1, hipStreamWaitValueGte), hipSuccess);
+  ASSERT_EQ(hipStreamWriteValue64(stream, ran, 1, 0), hipSuccess);
+
+  // Shared with the destroying thread, which may outlive the test if
+  // hipStreamDestroy never returns.
+  struct DestroyResult {
+    std::atomic<bool> done{false};
+    std::atomic<hipError_t> status{hipErrorUnknown};
+  };
+  const auto result = std::make_shared<DestroyResult>();
+  destroyer = std::thread([result, stream] {
+    result->status.store(hipStreamDestroy(stream));
+    result->done = true;
+  });
+  std::this_thread::sleep_for(std::chrono::milliseconds(500));
+  const bool destroyed_before_gate_opened = result->done;
+  ASSERT_EQ(hipStreamWriteValue64(opener, gate, 1, 0), hipSuccess);
+  ASSERT_EQ(hipStreamSynchronize(opener), hipSuccess);
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(10);
+  while (!result->done && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  if (!result->done) {
+    destroy_hung = true;
+    destroyer.detach();
+    FAIL() << "hipStreamDestroy did not return within 10 s of the gate opening";
+  }
+
+  EXPECT_FALSE(destroyed_before_gate_opened);
+  EXPECT_EQ(result->status, hipSuccess);
+  uint64_t ran_value = 0;
+  ASSERT_EQ(
+      hipMemcpy(&ran_value, ran, sizeof(ran_value), hipMemcpyDeviceToHost),
+      hipSuccess);
+  EXPECT_EQ(ran_value, 1u);
+}
+
+// A thread that first needs a handle mid-capture, like an autograd worker in
+// backward, cannot create one, so CUDAGraph::capture_begin() stocks a spare.
+// The handles exited threads returned belong to their streams and must not
+// count as that spare.
+TEST(CUDABlasHandlePoolTest, LtHandleUnderCaptureTakesUnusedSpare) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  at::cuda::CUDAGuard device_guard(0);
+  const auto first = c10::cuda::getStreamFromPool();
+  const auto second = c10::cuda::getStreamFromPool();
+  cublasLtHandle_t returned = nullptr;
+  runOnThread([&] {
+    at::cuda::CUDAGuard guard(0);
+    c10::cuda::CUDAStreamGuard stream_guard(first);
+    returned = at::cuda::getCurrentCUDABlasLtHandle();
+  });
+
+  at::cuda::ensureCublasLtHandlesAvailable(1);
+  ASSERT_EQ(
+      cudaStreamBeginCapture(second, cudaStreamCaptureModeGlobal), cudaSuccess);
+  cublasLtHandle_t reused = nullptr;
+  std::exception_ptr failure;
+  std::thread worker([&] {
+    try {
+      at::cuda::CUDAGuard guard(0);
+      c10::cuda::CUDAStreamGuard stream_guard(second);
+      reused = at::cuda::getCurrentCUDABlasLtHandle();
+    } catch (...) {
+      failure = std::current_exception();
+    }
+  });
+  worker.join();
+  cudaGraph_t graph = nullptr;
+  const auto end_status = cudaStreamEndCapture(second, &graph);
+  if (graph != nullptr) {
+    (void)cudaGraphDestroy(graph);
+  }
+
+  if (failure) {
+    std::rethrow_exception(failure);
+  }
+  EXPECT_EQ(end_status, cudaSuccess) << cudaGetErrorString(end_status);
+  EXPECT_NE(reused, returned);
+}
+
+namespace {
+// Counts the warnings about hipStreamPerThread that this thread emits.
+struct PerThreadStreamWarnings : c10::WarningHandler {
+  int count = 0;
+  void process(const c10::Warning& warning) override {
+    count += warning.msg().find("hipStreamPerThread") != std::string::npos;
+  }
+};
+} // namespace
+
+// The warning about a kept hipStreamPerThread handle prints at most once for
+// all pools, and not for a lookup that keeps no handle. TORCH_WARN_ONCE keeps
+// its state for the process, so an earlier test may already have printed it.
+TEST(CUDABlasHandlePoolTest, PerThreadStreamWarnsOnceWhenHandleKept) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  cublasLtHandle_t looked_up = nullptr;
+  int after_lookup = 0;
+  int total = 0;
+  runOnThread([&] {
+    PerThreadStreamWarnings warnings;
+    c10::WarningUtils::WarningHandlerGuard handler_guard(&warnings);
+    at::cuda::CUDAGuard guard(0);
+    c10::cuda::CUDAStreamGuard stream_guard(
+        c10::cuda::getStreamFromExternal(hipStreamPerThread, 0));
+    looked_up = at::cuda::getCurrentCUDABlasLtHandleIfAvailable();
+    after_lookup = warnings.count;
+    (void)at::cuda::getCurrentCUDABlasLtHandle();
+    (void)at::cuda::getCurrentCUDABlasHandle();
+    (void)currentInternalCublasHandle();
+    total = warnings.count;
+  });
+  if (looked_up == nullptr) {
+    EXPECT_EQ(after_lookup, 0);
+  }
+  EXPECT_LE(total, 1);
+}
+
+// hipStreamPerThread is a different stream in each thread, so a handle used on
+// it is not returned to the pool.
+TEST(CUDABlasHandlePoolTest, LtHandleForPerThreadStreamIsNotReused) {
+  if (!at::cuda::is_available()) {
+    return;
+  }
+  const auto handle_on_per_thread_stream = [] {
+    cublasLtHandle_t handle = nullptr;
+    runOnThread([&] {
+      at::cuda::CUDAGuard guard(0);
+      c10::cuda::CUDAStreamGuard stream_guard(
+          c10::cuda::getStreamFromExternal(hipStreamPerThread, 0));
+      handle = at::cuda::getCurrentCUDABlasLtHandle();
+    });
+    return handle;
+  };
+  const auto first = handle_on_per_thread_stream();
+  EXPECT_NE(handle_on_per_thread_stream(), first);
 }
 
 #endif // USE_ROCM

@@ -1469,11 +1469,16 @@ def current_blas_handle():
     pool reserved for these buffers, at least as large as the workspace rocBLAS would allocate, which
     rocBLAS never grows. A workspace bound with
     ``rocblas_set_workspace`` stays bound, even after the thread exits and the
-    handle passes to another thread, so unbind it before freeing the buffer.
-    While the current stream is capturing, ROCm returns a capture handle
-    instead, bound to a workspace from the capture's memory pool: call this
-    function inside the capture rather than reusing a handle obtained before
-    it, and do not use the capture handle after the capture ends.
+    handle passes to a later thread using the same stream, so unbind it before
+    freeing the buffer. A handle for ``hipStreamPerThread`` passes to no other
+    thread. While the current stream is capturing, ROCm returns a capture
+    handle instead, bound to a workspace from the capture's memory pool: call
+    this function inside the capture rather than reusing a handle obtained
+    before it, and do not use the capture handle after the capture ends. With
+    ``TORCH_CUBLAS_WORKSPACE_CACHE=1``, ROCm instead returns ATen's own
+    handles: one for each thread and stream outside capture, and inside a
+    capture the thread's handle for the device, which serves every stream in
+    the capture.
     """
     _lazy_init()
     return torch._C._cuda_getCurrentBlasHandle()
